@@ -516,8 +516,15 @@ void send_room_info(int socket)
 void send_room_client_list(int room_number, int client_socket)
 {
     char msg[BUFFER_SIZE];
-    snprintf(msg, BUFFER_SIZE, "\n\033[1;36m[ Room %d: %s ]\033[0m\n", 
-             room_number, rooms[room_number - 1].name);
+    if (room_number > 0)
+    {
+        snprintf(msg, BUFFER_SIZE, "\n\033[1;36m[ Room %d: %s ]\033[0m\n", 
+            room_number, rooms[room_number - 1].name);
+    }
+    else
+    {
+        snprintf(msg, BUFFER_SIZE, "\n\033[1;36m[ Not in Any Room ]\033[0m\n");
+    }
     send(client_socket, msg, strlen(msg), 0);
 
     int found = 0;
@@ -535,7 +542,7 @@ void send_room_client_list(int room_number, int client_socket)
 
     if (!found)
     {
-        snprintf(msg, sizeof(msg), "  (No clients in this room)\n");
+        snprintf(msg, BUFFER_SIZE, "  (No clients in this room)\n");
         send(client_socket, msg, strlen(msg), 0);
     }
 }
@@ -543,7 +550,7 @@ void send_room_client_list(int room_number, int client_socket)
 // List clients in all rooms
 void send_all_clients_list(int client_socket)
 {
-    for (int r = 1; r <= MAX_ROOMS; r++)
+    for (int r = 0; r <= MAX_ROOMS; r++)
     {
         send_room_client_list(r, client_socket);
     }
