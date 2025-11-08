@@ -1,0 +1,17 @@
+CollaboSphere/
+│
+├─ server/                 # All server-side code
+│   ├─ main.c              # Entry point of the server
+│   ├─ server.c            # Functions for socket creation, bind, listen and chatting
+│   ├─ server.h            # Declarations of server.c functions
+│   ├─ utils.c             # Helper functions (e.g., error handling)
+│   └─ utils.h             # Declarations of utils.c
+│
+├─ client/                 # All client-side code
+│   ├─ main.c              # Entry point of the client
+│   ├─ client.c            # Functions for connecting, sending, receiving
+│   └─ client.h            # Declarations of client.c
+│   ├─ utils.c            # Helper functions (e.g., error handling)
+│   └─ utils.h            # Declarations of utils.c
+│
+└─ Makefile                # Optional, for easy compilation
