@@ -629,7 +629,7 @@ void *handle_client(void *arg)
             else if (strncmp(buffer, "/ls -", 5) == 0)
             {
                 int room_num = atoi(buffer + 5);
-                if (room_num >= 1 && room_num <= MAX_ROOMS)
+                if (room_num >= 0 && room_num <= MAX_ROOMS)
                 {
                   send_room_client_list(room_num, ci->client_socket);
                 }

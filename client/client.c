@@ -212,9 +212,7 @@ void *send_to_server(void *arg)
         // Only treat it as a password prompt when joining_room5 == 1 and the last server message matches the VIP prompt strings.
         int is_password_prompt = 0;
         pthread_mutex_lock(&msg_mutex);
-        if (joining_room5 &&
-            (strstr(last_server_msg, "Enter VIP room password:") != NULL ||
-             strstr(last_server_msg, "Incorrect password. Try again:") != NULL))
+        if (joining_room5)
         {
             is_password_prompt = 1;
         }
