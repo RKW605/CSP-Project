@@ -24,6 +24,15 @@ pthread_mutex_t msg_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Track if user is joining room 5 (for password input)
 static int joining_room5 = 0;
 
+// Save/restore terminal settings safely
+static struct termios orig_termios;
+static int orig_termios_saved = 0;
+
+// Synchronization for password phase
+static pthread_mutex_t password_done_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t password_done_cond = PTHREAD_COND_INITIALIZER;
+static int waiting_for_password_done = 0;
+
 // Ignore external signals; rely on /disconnect for clean shutdown
 static void ignore_signals(void)
 {
@@ -42,7 +51,16 @@ static void ignore_signals(void)
 #endif
 }
 
-// Connect to server with 5 second timeout
+static void save_original_termios(void)
+{
+    if (!orig_termios_saved)
+    {
+        if (tcgetattr(STDIN_FILENO, &orig_termios) == 0)
+            orig_termios_saved = 1;
+    }
+}
+
+// Connect to server with timeout
 int connect_to_server(const char *ip, int port)
 {
     int server_connection_fd;
@@ -53,15 +71,14 @@ int connect_to_server(const char *ip, int port)
     int result;
     int so_error;
     socklen_t len = sizeof(so_error);
-    
-    // Ignore external termination signals; rely on /disconnect
+
     ignore_signals();
-    
+
     server_connection_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_connection_fd < 0)
         return -1;
-    
-    // Set socket to non-blocking mode
+
+    // Non-blocking connect with timeout
     flags = fcntl(server_connection_fd, F_GETFL, 0);
     if (flags < 0)
     {
@@ -73,83 +90,80 @@ int connect_to_server(const char *ip, int port)
         close(server_connection_fd);
         return -1;
     }
-    
+
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(port);
     server_addr.sin_addr.s_addr = inet_addr(ip);
-    
-    // Attempt connection (will return immediately with non-blocking socket)
+
     result = connect(server_connection_fd, (struct sockaddr *)&server_addr, sizeof(server_addr));
-    
     if (result < 0 && errno != EINPROGRESS)
     {
         close(server_connection_fd);
         return -1;
     }
-    
-    // If connection didn't complete immediately, wait with timeout
+
     if (result < 0 && errno == EINPROGRESS)
     {
         FD_ZERO(&writefds);
         FD_SET(server_connection_fd, &writefds);
-
-        timeout.tv_sec = 7;  // 7 second timeout
+        timeout.tv_sec = 7;
         timeout.tv_usec = 0;
-        
         result = select(server_connection_fd + 1, NULL, &writefds, NULL, &timeout);
-        
+
         if (result <= 0)
         {
-            // Timeout or error
             close(server_connection_fd);
             return -1;
         }
-        
-        // Check if connection was successful
+
         if (getsockopt(server_connection_fd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error != 0)
         {
             close(server_connection_fd);
             return -1;
         }
     }
-    
-    // Set socket back to blocking mode
+
+    // Back to blocking
     flags = fcntl(server_connection_fd, F_GETFL, 0);
     if (flags >= 0)
-    {
         fcntl(server_connection_fd, F_SETFL, flags & ~O_NONBLOCK);
-    }
 
     printf("\n\033[1;33m🛜   Connected to server!   🛜\033[0m\n\n");
     fflush(stdout);
+
+    save_original_termios();
     return server_connection_fd;
 }
 
-// Helper function to read hidden input (no echo)
+// Read hidden input (password)
 void read_hidden_input(char *buf, size_t size)
 {
-    struct termios oldt, newt;
-    tcgetattr(STDIN_FILENO, &oldt);
-    newt = oldt;
-    newt.c_lflag &= ~(ECHO);
-    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    struct termios t;
+    if (!orig_termios_saved)
+        save_original_termios();
 
-    fgets(buf, size, stdin);
-    buf[strcspn(buf, "\n")] = 0;
+    tcgetattr(STDIN_FILENO, &t);
+    struct termios hidden = t;
+    hidden.c_lflag &= ~(ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &hidden);
 
-    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    if (fgets(buf, size, stdin) == NULL)
+        buf[0] = '\0';
+    else
+        buf[strcspn(buf, "\n")] = 0;
+
+    tcflush(STDIN_FILENO, TCIFLUSH);
 }
 
-// Receive messages
+// Receive messages from server
 void *recv_from_server(void *arg)
 {
     connection_info *ci = (connection_info *)arg;
     char buffer[BUFFER_SIZE];
-    
-    // Allow this thread to be canceled asynchronously
+
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-    
+
     while (1)
     {
         memset(buffer, 0, BUFFER_SIZE);
@@ -157,93 +171,105 @@ void *recv_from_server(void *arg)
         if (bytes <= 0)
         {
             myPrint("\n\033[1;91mServer disconnected. Exiting...❌\033[0m\n");
-            // Calmly cancel the send thread
             pthread_cancel(ci->send_thread);
-            close(ci->server_connection_fd); // close socket
+            close(ci->server_connection_fd);
             break;
         }
+
         buffer[bytes] = '\0';
 
-        // Store last message for password detection
         pthread_mutex_lock(&msg_mutex);
         strncpy(last_server_msg, buffer, BUFFER_SIZE - 1);
-        
-        // If server indicates success or final denial, stop password mode
+
+        // Case 1: Password phase completed (success or permanent denial)
         if ((strstr(buffer, "Correct password! Access granted to VIP room.") != NULL ||
-        strstr(buffer, "You joined room") != NULL ||
-        strstr(buffer, "Too many failed attempts. Access denied.") != NULL) && (strchr(buffer, ':') == NULL))
+             strstr(buffer, "Too many failed attempts. Access denied.") != NULL ||
+             (strstr(buffer, "You joined room") != NULL && strstr(buffer, "VIP") == NULL)) &&
+            (strchr(buffer, ':') == NULL))
         {
             joining_room5 = 0;
+
+            if (orig_termios_saved)
+            {
+                tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+                tcflush(STDIN_FILENO, TCIFLUSH);
+                fflush(stdout);
+            }
+
+            pthread_mutex_lock(&password_done_mutex);
+            waiting_for_password_done = 0;
+            pthread_cond_signal(&password_done_cond);
+            pthread_mutex_unlock(&password_done_mutex);
         }
+
+        // Case 2: Incorrect password → signal send thread to prompt again
+        else if (strstr(buffer, "Incorrect password") != NULL)
+        {
+            pthread_mutex_lock(&password_done_mutex);
+            waiting_for_password_done = 0; // allow send thread to retry
+            pthread_cond_signal(&password_done_cond);
+            pthread_mutex_unlock(&password_done_mutex);
+        }
+
         pthread_mutex_unlock(&msg_mutex);
 
         myPrint("%s", buffer);
     }
-    
+
     pthread_exit(NULL);
 }
 
-// Send messages
+// Send messages to server
 void *send_to_server(void *arg)
 {
     connection_info *ci = (connection_info *)arg;
-    
-    // Allow this thread to be canceled asynchronously
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-    
+
     char buffer[BUFFER_SIZE];
-    // Ask for name
     char name[NAME_SIZE];
-    // Very edge case mutex, like if we just connected and server immediately disconnects
+
     myPrint("\033[1;38;2;0;255;102mEnter your name: \033[0m");
     fgets(name, NAME_SIZE, stdin);
     name[strcspn(name, "\n")] = 0;
     send(ci->server_connection_fd, name, strlen(name), 0);
-    
+
     while (1)
     {
-        // Small delay to let recv thread update last_server_msg
-        usleep(100000); // 100ms
-        
+        usleep(150000);
         memset(buffer, 0, BUFFER_SIZE);
 
-        // Decide if server just asked for the VIP password.
-        // Only treat it as a password prompt when joining_room5 == 1 and the last server message matches the VIP prompt strings.
         int is_password_prompt = 0;
         pthread_mutex_lock(&msg_mutex);
         if (joining_room5)
-        {
             is_password_prompt = 1;
-        }
         pthread_mutex_unlock(&msg_mutex);
 
         if (is_password_prompt)
         {
-            // Use hidden input for password
             read_hidden_input(buffer, BUFFER_SIZE);
             printf("\n");
             send(ci->server_connection_fd, buffer, strlen(buffer), 0);
-            
-            // Leave joining_room5 set — recv thread will clear it on success or final denial.
-            // Clear the last message so we don't re-trigger unnecessarily
+
+            pthread_mutex_lock(&password_done_mutex);
+            waiting_for_password_done = 1;
+            while (waiting_for_password_done)
+                pthread_cond_wait(&password_done_cond, &password_done_mutex);
+            pthread_mutex_unlock(&password_done_mutex);
+
             pthread_mutex_lock(&msg_mutex);
             memset(last_server_msg, 0, BUFFER_SIZE);
             pthread_mutex_unlock(&msg_mutex);
             continue;
         }
 
-        // Normal input
-        fgets(buffer, BUFFER_SIZE, stdin);
+        if (!fgets(buffer, BUFFER_SIZE, stdin))
+            continue;
+
         buffer[strcspn(buffer, "\n")] = 0;
 
-        // If user typed "/join5" locally, enable VIP-password-mode
-        // (we set this flag before sending so the next server prompt will be handled as hidden)
         if (strncmp(buffer, "/join5", 6) == 0)
-        {
             joining_room5 = 1;
-            // fall through to send "/join5" to server
-        }
 
         if (strcmp(buffer, "/disconnect") == 0)
         {
@@ -252,8 +278,7 @@ void *send_to_server(void *arg)
             close(ci->server_connection_fd);
             break;
         }
-        
-        // Add help command for better UX
+
         if (strcmp(buffer, "/help") == 0)
         {
             pthread_mutex_lock(&print_mutex);
@@ -262,34 +287,31 @@ void *send_to_server(void *arg)
             printf("  /exit              - Leave current room\n");
             printf("  /rooms             - List all rooms\n");
             printf("  /room              - Show current room\n");
-            printf("  /clear             - Clear your screen, Messages will not be removed\n");
-            printf("  /clear -hard       - Empty your screen, Messages will be removed\n");
-            printf("  /disconnect        - Disconnect from server\n");
-            printf("  /help              - Show this help\n");
-            printf("  /ls -all           - Show all the clients\n");
-            printf("  /ls -<room-number> - Show clients of the specific room\033[0m\n\n");
+            printf("  /clear             - Clear your screen\n");
+            printf("  /clear -hard       - Hard clear\n");
+            printf("  /disconnect        - Disconnect\n");
+            printf("  /help              - Show help\n");
+            printf("  /ls -all           - Show all clients\n");
+            printf("  /ls -<room-number> - Show specific room clients\033[0m\n\n");
             fflush(stdout);
             pthread_mutex_unlock(&print_mutex);
             continue;
         }
-        
-        // Handle local-only clear command
+
         if (strcmp(buffer, "/clear") == 0)
         {
-            // ANSI escape sequence to clear screen and move cursor to home
             myPrint("\033[2J\033[H");
-            continue; // do not send to server
+            continue;
         }
 
-        // Handle local-only hard clear command
         if (strcmp(buffer, "/clear -hard") == 0)
         {
             clear_screen();
-            continue; // do not send to server
+            continue;
         }
-        
+
         send(ci->server_connection_fd, buffer, strlen(buffer), 0);
     }
-    
+
     pthread_exit(NULL);
 }
