@@ -142,13 +142,41 @@ void broadcast_message(const char *msg, int sender_socket)
     // Mutex ensures the clients array isn't modified by another thread
     // (e.g., a client joining or leaving) while we are iterating over it
     pthread_mutex_lock(&clients_mutex);
+    
+    // Find sender's name
+    char sender_name[NAME_SIZE] = {0};
+    for (int i = 0; i < client_count; i++)
+    {
+        if (clients[i].client_socket == sender_socket)
+        {
+            strncpy(sender_name, clients[i].name, NAME_SIZE - 1);
+            sender_name[NAME_SIZE - 1] = '\0';
+            break;
+        }
+    }
+    
     size_t msg_length = strlen(msg);
     for (int i = 0; i < client_count; i++)
     {
         int sock = clients[i].client_socket;
         if (sock != sender_socket)
         {
-            send(sock, msg, msg_length, 0);
+            // Check if this recipient has muted the sender
+            int is_muted = 0;
+            for (int j = 0; j < clients[i].muted_count; j++)
+            {
+                if (clients[i].muted_users[j][0] != '\0' && 
+                    strcasecmp(clients[i].muted_users[j], sender_name) == 0)
+                {
+                    is_muted = 1;
+                    break;
+                }
+            }
+            
+            if (!is_muted)
+            {
+                send(sock, msg, msg_length, 0);
+            }
         }
     }
     pthread_mutex_unlock(&clients_mutex);
@@ -440,15 +468,51 @@ void broadcast_to_room(const char *msg, int sender_socket, int room_number)
 
     myPrint("\nBroadcasting to room %d: %s", room_number + 1, msg);
 
+    // Find sender's name
+    char sender_name[NAME_SIZE] = {0};
+    for (int i = 0; i < client_count; i++)
+    {
+        if (clients[i].client_socket == sender_socket)
+        {
+            strncpy(sender_name, clients[i].name, NAME_SIZE - 1);
+            sender_name[NAME_SIZE - 1] = '\0';
+            myPrint("\nSender found: %s (socket %d)\n", sender_name, sender_socket);
+            break;
+        }
+    }
+
     int sent_count = 0;
     for (int i = 0; i < client_count; i++)
     {
         if (clients[i].client_socket != sender_socket && clients[i].current_room == room_number)
         {
+            myPrint("\nChecking recipient %s (muted_count=%d)\n", clients[i].name, clients[i].muted_count);
+            
+            // Check if this recipient has muted the sender
+            int is_muted = 0;
+            for (int j = 0; j < clients[i].muted_count; j++)
+            {
+                myPrint("  Muted user[%d]: '%s' vs sender '%s'\n", j, clients[i].muted_users[j], sender_name);
+                if (clients[i].muted_users[j][0] != '\0' && 
+                    strcasecmp(clients[i].muted_users[j], sender_name) == 0)
+                {
+                    is_muted = 1;
+                    myPrint("  -> MATCH! User is muted!\n");
+                    break;
+                }
+            }
+            
+            if (is_muted)
+            {
+                myPrint("Message not sent to %s (muted)\n", clients[i].name);
+                continue;
+            }
+            
             int bytes_sent = send(clients[i].client_socket, msg, strlen(msg), 0);
             if (bytes_sent > 0)
             {
                 sent_count++;
+                myPrint("Message sent to %s\n", clients[i].name);
             }
             else
             {
@@ -556,6 +620,184 @@ void send_all_clients_list(int client_socket)
     }
 }
 
+void handle_mute_command(client_info *ci, const char *command)
+{
+    char target_name[NAME_SIZE];
+    if (sscanf(command, "/mute %49s", target_name) != 1)
+    {
+        char msg[] = "\033[1;93mUsage: /mute <username> or /mute -all\033[0m\n";
+        send(ci->client_socket, msg, strlen(msg), 0);
+        return;
+    }
+
+    myPrint("\n[DEBUG] %s is trying to mute: %s\n", ci->name, target_name);
+
+    if (strcmp(target_name, "-all") == 0)
+    {
+        // Mute all connected clients
+        pthread_mutex_lock(&clients_mutex);
+        for (int i = 0; i < client_count; i++)
+        {
+            if (clients[i].client_socket != ci->client_socket)
+            {
+                // Find the matching global client entry and add to mute list
+                for (int k = 0; k < client_count; k++)
+                {
+                    if (clients[k].client_socket == ci->client_socket)
+                    {
+                        // Check if already muted
+                        int already_muted = 0;
+                        for (int j = 0; j < clients[k].muted_count; j++)
+                        {
+                            if (strcmp(clients[k].muted_users[j], clients[i].name) == 0)
+                            {
+                                already_muted = 1;
+                                break;
+                            }
+                        }
+                        
+                        if (!already_muted && clients[k].muted_count < MAX_CLIENTS)
+                        {
+                            strncpy(clients[k].muted_users[clients[k].muted_count], clients[i].name, NAME_SIZE - 1);
+                            clients[k].muted_users[clients[k].muted_count][NAME_SIZE - 1] = '\0';
+                            myPrint("[DEBUG] Muted %s. Total muted: %d\n", clients[i].name, clients[k].muted_count + 1);
+                            clients[k].muted_count++;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        pthread_mutex_unlock(&clients_mutex);
+        char msg[] = "\033[1;92mAll users muted.\033[0m\n";
+        send(ci->client_socket, msg, strlen(msg), 0);
+        return;
+    }
+
+    pthread_mutex_lock(&clients_mutex);
+    
+    // First, check if target user exists
+    int target_exists = 0;
+    for (int i = 0; i < client_count; i++)
+    {
+        if (strcasecmp(clients[i].name, target_name) == 0 && clients[i].client_socket != ci->client_socket)
+        {
+            target_exists = 1;
+            break;
+        }
+    }
+    
+    if (!target_exists)
+    {
+        pthread_mutex_unlock(&clients_mutex);
+        char msg[BUFFER_SIZE];
+        snprintf(msg, BUFFER_SIZE, "\033[1;91m❌ No client named '%s' found.\033[0m\n", target_name);
+        send(ci->client_socket, msg, strlen(msg), 0);
+        return;
+    }
+    
+    // Find the matching global client entry
+    for (int k = 0; k < client_count; k++)
+    {
+        if (clients[k].client_socket == ci->client_socket)
+        {
+            // Check if already muted
+            for (int i = 0; i < clients[k].muted_count; i++)
+            {
+                if (strcasecmp(clients[k].muted_users[i], target_name) == 0)
+                {
+                    pthread_mutex_unlock(&clients_mutex);
+                    char msg[BUFFER_SIZE];
+                    snprintf(msg, BUFFER_SIZE, "\033[1;91mUser %s is already muted.\033[0m\n", target_name);
+                    send(ci->client_socket, msg, strlen(msg), 0);
+                    return;
+                }
+            }
+
+            // Add to mute list if not full
+            if (clients[k].muted_count < MAX_CLIENTS)
+            {
+                strncpy(clients[k].muted_users[clients[k].muted_count], target_name, NAME_SIZE - 1);
+                clients[k].muted_users[clients[k].muted_count][NAME_SIZE - 1] = '\0';
+                clients[k].muted_count++;
+                myPrint("[DEBUG] %s muted %s. Total muted: %d\n", ci->name, target_name, clients[k].muted_count);
+                pthread_mutex_unlock(&clients_mutex);
+                char msg[BUFFER_SIZE];
+                snprintf(msg, BUFFER_SIZE, "\033[1;92mUser %s muted.\033[0m\n", target_name);
+                send(ci->client_socket, msg, strlen(msg), 0);
+                return;
+            }
+            else
+            {
+                pthread_mutex_unlock(&clients_mutex);
+                char msg[] = "\033[1;91mMute list full. Cannot mute more users.\033[0m\n";
+                send(ci->client_socket, msg, strlen(msg), 0);
+                return;
+            }
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+void handle_unmute_command(client_info *ci, const char *command)
+{
+    char target_name[NAME_SIZE];
+    if (sscanf(command, "/unmute %49s", target_name) != 1)
+    {
+        char msg[] = "\033[1;93mUsage: /unmute <username> or /unmute -all\033[0m\n";
+        send(ci->client_socket, msg, strlen(msg), 0);
+        return;
+    }
+
+    pthread_mutex_lock(&clients_mutex);
+    // Find the matching global client entry
+    for (int k = 0; k < client_count; k++)
+    {
+        if (clients[k].client_socket == ci->client_socket)
+        {
+            if (strcmp(target_name, "-all") == 0)
+            {
+                clients[k].muted_count = 0;
+                pthread_mutex_unlock(&clients_mutex);
+                char msg[] = "\033[1;92mAll users unmuted.\033[0m\n";
+                send(ci->client_socket, msg, strlen(msg), 0);
+                return;
+            }
+
+            // Find and remove the user from mute list
+            for (int i = 0; i < clients[k].muted_count; i++)
+            {
+                if (strcasecmp(clients[k].muted_users[i], target_name) == 0)
+                {
+                    // Shift remaining muted users to fill the gap
+                    for (int j = i; j < clients[k].muted_count - 1; j++)
+                    {
+                        strncpy(clients[k].muted_users[j], clients[k].muted_users[j + 1], NAME_SIZE - 1);
+                        clients[k].muted_users[j][NAME_SIZE - 1] = '\0';
+                    }
+                    // Clear the last entry
+                    clients[k].muted_users[clients[k].muted_count - 1][0] = '\0';
+                    clients[k].muted_count--;
+                    
+                    pthread_mutex_unlock(&clients_mutex);
+                    char msg[BUFFER_SIZE];
+                    snprintf(msg, BUFFER_SIZE, "\033[1;92mUser %s unmuted.\033[0m\n", target_name);
+                    send(ci->client_socket, msg, strlen(msg), 0);
+                    return;
+                }
+            }
+            
+            // User not found in mute list
+            pthread_mutex_unlock(&clients_mutex);
+            char msg[BUFFER_SIZE];
+            snprintf(msg, BUFFER_SIZE, "\033[1;91m❌ User '%s' is not in your mute list.\033[0m\n", target_name);
+            send(ci->client_socket, msg, strlen(msg), 0);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
 // Handle a single client
 void *handle_client(void *arg)
 {
@@ -620,6 +862,14 @@ void *handle_client(void *arg)
         {
             send_room_info(ci->client_socket);
         }
+        else if(strncmp(buffer, "/mute", 5) == 0)
+        {
+            handle_mute_command(ci, buffer);
+        }
+        else if(strncmp(buffer, "/unmute", 7) == 0)
+        {
+            handle_unmute_command(ci, buffer);
+        }
         else if (strncmp(buffer, "/ls", 3) == 0)
         {
             if (strcmp(buffer, "/ls -all") == 0)
@@ -635,7 +885,7 @@ void *handle_client(void *arg)
                 }
                 else
                 {
-                    char msg[] = "\033[1;91mInvalid room number. Use 1–5 or /ls -all.\033[0m\n";
+                    char msg[] = "\033[1;91mInvalid room number. Use 1-5 or /ls -all.\033[0m\n";
                     send(ci->client_socket, msg, strlen(msg), 0);
                 }
             }
@@ -660,17 +910,48 @@ void *handle_client(void *arg)
             message++;
 
             pthread_mutex_lock(&clients_mutex);
+            int recipient_found = 0;
             for (int i = 0; i < client_count; i++)
             {
                 if (strcasecmp(clients[i].name, recipient) == 0)
                 {
-                    char msg_buffer[BUFFER_SIZE];
-                    snprintf(msg_buffer, BUFFER_SIZE,
-                             "\033[1;95m🔒 Private from %s:\033[0m %s\n", ci->name, message);
-                    send(clients[i].client_socket, msg_buffer, strlen(msg_buffer), 0);
+                    recipient_found = 1;
+                    // Check if recipient has sender muted
+                    int is_muted = 0;
+                    for (int j = 0; j < clients[i].muted_count; j++)
+                    {
+                        if (clients[i].muted_users[j][0] != '\0' && 
+                            strcasecmp(clients[i].muted_users[j], ci->name) == 0)
+                        {
+                            is_muted = 1;
+                            break;
+                        }
+                    }
+                    
+                    if (is_muted)
+                    {
+                        char msg[BUFFER_SIZE];
+                        snprintf(msg, BUFFER_SIZE, "\033[1;91m%s has muted you. Message not delivered.\033[0m\n", recipient);
+                        send(ci->client_socket, msg, strlen(msg), 0);
+                    }
+                    else
+                    {
+                        char msg_buffer[BUFFER_SIZE];
+                        snprintf(msg_buffer, BUFFER_SIZE,
+                                 "\033[1;95m🔒 Private from %s:\033[0m %s\n", ci->name, message);
+                        send(clients[i].client_socket, msg_buffer, strlen(msg_buffer), 0);
+                    }
                     break;
                 }
             }
+            
+            if (!recipient_found)
+            {
+                char msg[BUFFER_SIZE];
+                snprintf(msg, BUFFER_SIZE, "\033[1;91m❌ No client named '%s' found.\033[0m\n", recipient);
+                send(ci->client_socket, msg, strlen(msg), 0);
+            }
+            
             pthread_mutex_unlock(&clients_mutex);
             continue;
         }

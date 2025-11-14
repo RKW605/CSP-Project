@@ -14,6 +14,8 @@ typedef struct
     int client_socket;
     char name[NAME_SIZE]; // client name
     int current_room; // -1 means not in any room
+    char muted_users[MAX_CLIENTS][NAME_SIZE]; // list of muted users
+    int muted_count;
 } client_info;
 
 typedef struct
@@ -30,6 +32,8 @@ void announce_join(client_info *ci);
 void announce_leave(client_info *ci);
 void add_client(client_info *ci);
 void remove_client(client_info *ci);
+void handle_mute_command(client_info *ci, const char *command);
+void handle_unmute_command(client_info *ci, const char *command);
 void *handle_client(void *arg);
 
 // Room management functions

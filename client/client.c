@@ -289,8 +289,12 @@ void *send_to_server(void *arg)
             printf("  /room              - Show current room\n");
             printf("  /clear             - Clear your screen\n");
             printf("  /clear -hard       - Hard clear\n");
-            printf("  /disconnect        - Disconnect\n");
+            printf("  /disconnect        - Disconnect from the server\n");
             printf("  /help              - Show help\n");
+            printf("  /mute <user>       - Mute a user\n");
+            printf("  /mute -all         - Mute everyone\n");
+            printf("  /unmute <user>     - Unmute a user\n");
+            printf("  /unmute -all       - Clear all mutes\n");
             printf("  /ls -all           - Show all clients\n");
             printf("  /ls -<room-number> - Show specific room clients\033[0m\n\n");
             fflush(stdout);

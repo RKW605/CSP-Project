@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sys/select.h>  // for select()
 #include <sys/time.h>   // for timeval
+#include <string.h>     // for memset()
 #include "server.h"
 #include "utils.h"
 
@@ -64,6 +65,8 @@ int main()
             pthread_t tid;
             client_info *ci = malloc(sizeof(client_info)); // allocate for thread
             ci->client_socket = client_socket;
+            ci->muted_count = 0; // Initialize muted_count
+            memset(ci->muted_users, 0, sizeof(ci->muted_users)); // Initialize muted_users array
 
             pthread_create(&tid, NULL, handle_client, ci);
             pthread_detach(tid);
